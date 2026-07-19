@@ -237,7 +237,9 @@ public class Recognizer extends NeuralNetworkApi {
                     detokenizerSession = onnxEnv.createSession(detokenizerPath, detokenizerSessionOptions);
 
                     initListener.onInitializationFinished();
-                } catch (OrtException e) {
+                } catch (Exception e) {
+                    // kxkb: catch everything, not just OrtException — an uncaught RuntimeException on
+                    // this thread (e.g. a corrupted model file) would kill the host IME process.
                     e.printStackTrace();
                     initListener.onError(new int[]{ErrorCodes.ERROR_LOADING_MODEL},0);
                 }
@@ -552,7 +554,9 @@ public class Recognizer extends NeuralNetworkApi {
 
                     Log.i("performance", "SPEECH RECOGNITION DONE IN: " + (SystemClock.elapsedRealtime() - startTimeInMs) + "ms");
 
-                } catch (OrtException e) {
+                } catch (Exception e) {
+                    // kxkb: catch everything, not just OrtException — an uncaught RuntimeException in
+                    // the decode loop would kill the host IME process instead of reporting an error.
                     e.printStackTrace();
                     notifyError(new int[]{ErrorCodes.ERROR_EXECUTING_MODEL}, 0);
                 }
@@ -590,7 +594,26 @@ public class Recognizer extends NeuralNetworkApi {
     }
 
     public void destroy() {
-        //eventually if in the future I decide to load Whisper only for WalkieTalkie and Conversation then all the resources will be released here
+        // kxkb: actually release the ONNX sessions (several hundred MB of native memory) so the host
+        // keyboard can unload the model after an idle period and reload it on the next mic press.
+        synchronized (lock) {
+            try {
+                if (initSession != null) initSession.close();
+                if (encoderSession != null) encoderSession.close();
+                if (cacheInitSession != null) cacheInitSession.close();
+                if (cacheInitBatchSession != null) cacheInitBatchSession.close();
+                if (decoderSession != null) decoderSession.close();
+                if (detokenizerSession != null) detokenizerSession.close();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+            initSession = null;
+            encoderSession = null;
+            cacheInitSession = null;
+            cacheInitBatchSession = null;
+            decoderSession = null;
+            detokenizerSession = null;
+        }
     }
 
     public int getLanguageID(String language){
