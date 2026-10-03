@@ -327,6 +327,9 @@ public class Recognizer extends NeuralNetworkApi {
                     final int eos = 50257;
                     ArrayList<Integer> completeOutput = new ArrayList<Integer>();
                     ArrayList<Integer> completeOutput2 = new ArrayList<Integer>();
+                    // kxkb: the chosen token's probability at every step, parallel to completeOutput —
+                    // the per-word confidence the host keyboard marks suspect words with.
+                    ArrayList<Float> tokenProbabilities = new ArrayList<Float>();
                     double outputProbability1 = 0;
                     double outputProbability2 = 0;
                     boolean finished1 = false;
@@ -385,6 +388,14 @@ public class Recognizer extends NeuralNetworkApi {
                     int[] decoderInitialInputIDs = {START_TOKEN_ID, languageID, (batchSize == 1 && data.action == ACTION_TRANSLATE) ? TRANSLATE_TOKEN_ID : TRANSCRIBE_TOKEN_ID, NO_TIMESTAMPS_TOKEN_ID};
                     int[] decoderInitialInputIDs2 = {START_TOKEN_ID, languageID2, TRANSCRIBE_TOKEN_ID, NO_TIMESTAMPS_TOKEN_ID};
                     
+                    final LogitBias bias = batchSize == 1 ? logitBias : null;
+                    if (bias != null) {
+                        try {
+                            bias.reset();
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                        }
+                    }
                     while (!(max == eos && max2 == eos)) {
                         initialTime = System.currentTimeMillis();
                         time = System.currentTimeMillis();
@@ -436,9 +447,32 @@ public class Recognizer extends NeuralNetworkApi {
                         decoderOutput = (OnnxTensor) result.get("logits").get();
                         value = (float[][][]) decoderOutput.getValue();
                         outputValues = value[0][0];
+                        // kxkb: from step 4 on the prediction is real output (steps 1-3 are overridden by the
+                        // fixed prefix) — the host's bias may favour its vocabulary before the pick. The
+                        // probability below is measured on the UNBIASED logits.
+                        float[] pickFrom = outputValues;
+                        if (bias != null && j >= 4 && !finished1) {
+                            try {
+                                pickFrom = outputValues.clone();
+                                bias.adjust(pickFrom);
+                            } catch (Exception e) {
+                                e.printStackTrace();
+                                pickFrom = outputValues;
+                            }
+                        }
                         if(!finished1) {
-                            max = Utils.getIndexOfLargest(outputValues);
+                            max = Utils.getIndexOfLargest(pickFrom);
                             completeOutput.add(max);
+                            if (bias != null && j >= 4 && max < eos) {
+                                try {
+                                    bias.accept(max);
+                                } catch (Exception e) {
+                                    e.printStackTrace();
+                                }
+                            }
+                            if (batchSize == 1) {
+                                tokenProbabilities.add((float) Math.exp(outputValues[max] - Utils.logSumExpFast(outputValues)));
+                            }
                         }
                         if(batchSize == 2){
                             outputValues2 = value[1][0];
@@ -499,6 +533,7 @@ public class Recognizer extends NeuralNetworkApi {
                     if(batchSize == 1) {
                         String language = data.languageCode;
                         String finalText = UNDEFINED_TEXT;
+                        WordConfidences wordConfidences = null;
                         if(!execution1HitMaxLength) {
                             int[] sequences = completeOutput.stream().mapToInt(i -> i).toArray();
                             if (language.equals("auto")) language = getLanguageCode(sequences);
@@ -507,12 +542,21 @@ public class Recognizer extends NeuralNetworkApi {
                             Object finalTextResult = detokenizerOutputs.get(0).getValue();
                             finalText = ((String[][]) finalTextResult)[0][0];
                             detokenizerOutputs.close();
+                            try {
+                                wordConfidences = computeWordConfidences(completeOutput, tokenProbabilities, eos);
+                            } catch (Exception e) {
+                                // Confidence is an extra — a failure here must never cost the transcription.
+                                e.printStackTrace();
+                                wordConfidences = null;
+                            }
                         }
                         //Log.i("result", "result: " + correctText(finalText));
                         //Log.i("score", "score: " + outputProbability1);
 
                         outputs.close();
-                        notifyResult(correctText(finalText), language, outputProbability1, true);
+                        notifyResult(correctText(finalText), language, outputProbability1, true,
+                                wordConfidences == null ? null : wordConfidences.words,
+                                wordConfidences == null ? null : wordConfidences.confidences);
 
                     }else{
                         String language = data.languageCode;
@@ -566,6 +610,99 @@ public class Recognizer extends NeuralNetworkApi {
             recognize();
         }else {
             recognizing = false;
+        }
+    }
+
+    /** kxkb: the raw (uncorrected) words of a transcription, each with its lowest token probability. */
+    private static final class WordConfidences {
+        final String[] words;
+        final float[] confidences;
+
+        WordConfidences(String[] words, float[] confidences) {
+            this.words = words;
+            this.confidences = confidences;
+        }
+    }
+
+    /**
+     * kxkb: per-word confidence = the LOWEST probability of any token that contributed to the word
+     * (the faster-whisper convention). Tokens are mapped to characters by detokenizing growing prefixes
+     * of the text-token sequence: token k contributes the characters its prefix adds. A token that ends
+     * mid-character (a multi-byte Czech/Cyrillic/kana glyph split across tokens) adds nothing visible on
+     * its own — its probability is carried into the next token that does.
+     */
+    private WordConfidences computeWordConfidences(ArrayList<Integer> output, ArrayList<Float> probabilities, int eos) throws Exception {
+        ArrayList<Integer> tokens = new ArrayList<Integer>();
+        ArrayList<Float> probs = new ArrayList<Float>();
+        for (int i = 0; i < output.size() && i < probabilities.size(); i++) {
+            int token = output.get(i);
+            if (token < eos) {  // text tokens only; specials and timestamps sit above eos
+                tokens.add(token);
+                probs.add(probabilities.get(i));
+            }
+        }
+        if (tokens.isEmpty()) return null;
+
+        int n = tokens.size();
+        int[] tokenStart = new int[n];
+        int[] tokenEnd = new int[n];
+        float[] tokenProb = new float[n];
+        String text = "";
+        int previousLength = 0;
+        float carried = 1f;
+        for (int k = 0; k < n; k++) {
+            int[] prefix = new int[k + 1];
+            for (int i = 0; i <= k; i++) prefix[i] = tokens.get(i);
+            String prefixText = detokenize(prefix);
+            int visible = prefixText.length();
+            while (visible > 0 && prefixText.charAt(visible - 1) == '\uFFFD') visible--;
+            float p = Math.min(carried, probs.get(k));
+            if (visible <= previousLength) {
+                carried = p;
+                tokenStart[k] = previousLength;
+                tokenEnd[k] = previousLength;
+                tokenProb[k] = 1f;
+                continue;
+            }
+            carried = 1f;
+            tokenStart[k] = previousLength;
+            tokenEnd[k] = visible;
+            tokenProb[k] = p;
+            previousLength = visible;
+            text = prefixText.substring(0, visible);
+        }
+
+        ArrayList<String> words = new ArrayList<String>();
+        ArrayList<Float> confidences = new ArrayList<Float>();
+        int i = 0;
+        while (i < text.length()) {
+            if (Character.isWhitespace(text.charAt(i))) { i++; continue; }
+            int start = i;
+            while (i < text.length() && !Character.isWhitespace(text.charAt(i))) i++;
+            int end = i;
+            float min = 1f;
+            for (int k = 0; k < n; k++) {
+                if (tokenEnd[k] > start && tokenStart[k] < end) min = Math.min(min, tokenProb[k]);
+            }
+            words.add(text.substring(start, end));
+            confidences.add(min);
+        }
+        String[] wordArray = words.toArray(new String[0]);
+        float[] confidenceArray = new float[confidences.size()];
+        for (int c = 0; c < confidenceArray.length; c++) confidenceArray[c] = confidences.get(c);
+        return new WordConfidences(wordArray, confidenceArray);
+    }
+
+    private String detokenize(int[] sequence) throws Exception {
+        Map<String, OnnxTensor> inputs = new LinkedHashMap<String, OnnxTensor>();
+        OnnxTensor tensor = TensorUtils.createInt32Tensor(onnxEnv, sequence, new long[]{1, 1, sequence.length});
+        inputs.put("sequences", tensor);
+        OrtSession.Result outputs = this.detokenizerSession.run(inputs);
+        try {
+            return ((String[][]) outputs.get(0).getValue())[0][0];
+        } finally {
+            outputs.close();
+            tensor.close();
         }
     }
 
@@ -637,6 +774,13 @@ public class Recognizer extends NeuralNetworkApi {
         }
     }
 
+    // kxkb: the host's vocabulary bias (null = none); read once per transcription.
+    private volatile LogitBias logitBias = null;
+
+    public void setLogitBias(LogitBias bias) {
+        this.logitBias = bias;
+    }
+
     public void addCallback(final RecognizerListener callback) {
         callbacks.add(callback);
     }
@@ -653,9 +797,10 @@ public class Recognizer extends NeuralNetworkApi {
         multiCallbacks.remove(callback);
     }
 
-    private void notifyResult(String text, String languageCode, double confidenceScore, boolean isFinal) {
+    private void notifyResult(String text, String languageCode, double confidenceScore, boolean isFinal,
+                              String[] words, float[] wordConfidences) {
         for (int i = 0; i < callbacks.size(); i++) {
-            callbacks.get(i).onSpeechRecognizedResult(text, languageCode, confidenceScore, isFinal);
+            callbacks.get(i).onSpeechRecognizedWords(text, languageCode, confidenceScore, isFinal, words, wordConfidences);
         }
     }
 

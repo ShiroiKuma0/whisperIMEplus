@@ -21,4 +21,14 @@ import com.whisperonnx.voice_translation.neural_networks.NeuralNetworkApiListene
 
 public interface RecognizerListener extends NeuralNetworkApiListener {
     void onSpeechRecognizedResult(String text, String languageCode, double confidenceScore, boolean isFinal);
+
+    /**
+     * kxkb: the same result plus the raw words of the transcription (before the capitalisation /
+     * timestamp clean-up) with each word's lowest token probability; both arrays are null when the
+     * confidences could not be computed. Defaults to the plain callback.
+     */
+    default void onSpeechRecognizedWords(String text, String languageCode, double confidenceScore, boolean isFinal,
+                                         String[] words, float[] wordConfidences) {
+        onSpeechRecognizedResult(text, languageCode, confidenceScore, isFinal);
+    }
 }
